@@ -60,6 +60,13 @@ func worker(id int, queue <-chan []byte) {
 	log.Printf("[worker %v] initialized with buffer size %v\n", id, bufferSize)
 	var bufferIndex, recordCount int
 
+	callFlush := func() {
+		workerWG.Add(1)
+		go flush(buffer)
+		buffer = &[bufferSize][]byte{}
+		bufferIndex = 0
+	}
+
 	for open := true; open; {
 		timer := time.NewTimer(bufferTimeout * time.Millisecond)
 		select {
@@ -74,18 +81,12 @@ func worker(id int, queue <-chan []byte) {
 			bufferIndex++
 			if bufferIndex == bufferSize {
 				log.Printf("[worker %v] flushing buffer by size\n", id)
-				workerWG.Add(1)
-				go flush(buffer)
-				buffer = &[bufferSize][]byte{}
-				bufferIndex = 0
+				callFlush()
 			}
 		case <-timer.C:
 			if len((*buffer)[0]) > 0 {
 				log.Printf("[worker %v] flushing buffer by timeout\n", id)
-				workerWG.Add(1)
-				go flush(buffer)
-				buffer = &[bufferSize][]byte{}
-				bufferIndex = 0
+				callFlush()
 			}
 		}
 	}
