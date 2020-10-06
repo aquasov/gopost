@@ -92,8 +92,7 @@ func worker(id int, queue <-chan []byte) {
 	}
 	if len((*buffer)[0]) > 0 {
 		log.Printf("[worker %v] flushing buffer for the last time\n", id)
-		workerWG.Add(1)
-		go flush(buffer)
+		callFlush()
 	}
 	log.Printf("[worker %v] finished, %v records processed\n", id, recordCount)
 	workerWG.Done()
