@@ -12,12 +12,13 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 )
 
 const (
 	numberOfWorkers = 1
-	bufferSize      = 2
-	bufferTimeout   = 1000
+	bufferSize      = 5
+	bufferTimeout   = 10000
 )
 
 var queue = make(chan []byte, 1024)
@@ -55,20 +56,37 @@ func validate(req *http.Request) bool {
 }
 
 func worker(id int, queue <-chan []byte) {
-	var bufferIndex, recordCount int
 	var buffer = &[bufferSize][]byte{}
 	log.Printf("[worker %v] initialized with buffer size %v\n", id, bufferSize)
-	for rec := range queue {
-		recordCount++
-		log.Printf("[worker %v] buffering record: %v\n", id, string(rec))
-		(*buffer)[bufferIndex] = rec
-		bufferIndex++
-		if bufferIndex == bufferSize {
-			log.Printf("[worker %v] flushing buffer\n", id)
-			workerWG.Add(1)
-			go flush(buffer)
-			buffer = &[bufferSize][]byte{}
-			bufferIndex = 0
+	var bufferIndex, recordCount int
+
+	for open := true; open; {
+		timer := time.NewTimer(bufferTimeout * time.Millisecond)
+		select {
+		case rec, ok := <-queue:
+			if !ok {
+				open = false
+				break
+			}
+			recordCount++
+			log.Printf("[worker %v] buffering record: %v\n", id, string(rec))
+			(*buffer)[bufferIndex] = rec
+			bufferIndex++
+			if bufferIndex == bufferSize {
+				log.Printf("[worker %v] flushing buffer by size\n", id)
+				workerWG.Add(1)
+				go flush(buffer)
+				buffer = &[bufferSize][]byte{}
+				bufferIndex = 0
+			}
+		case <-timer.C:
+			if len((*buffer)[0]) > 0 {
+				log.Printf("[worker %v] flushing buffer by timeout\n", id)
+				workerWG.Add(1)
+				go flush(buffer)
+				buffer = &[bufferSize][]byte{}
+				bufferIndex = 0
+			}
 		}
 	}
 	if len((*buffer)[0]) > 0 {
@@ -78,6 +96,10 @@ func worker(id int, queue <-chan []byte) {
 	}
 	log.Printf("[worker %v] finished, %v records processed\n", id, recordCount)
 	workerWG.Done()
+}
+
+func flushByTimeout(buf *[bufferSize][]byte) {
+
 }
 
 func flush(buf *[bufferSize][]byte) {
