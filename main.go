@@ -98,10 +98,6 @@ func worker(id int, queue <-chan []byte) {
 	workerWG.Done()
 }
 
-func flushByTimeout(buf *[bufferSize][]byte) {
-
-}
-
 func flush(buf *[bufferSize][]byte) {
 	var jsonMap map[string]interface{}
 	for _, rec := range *buf {
