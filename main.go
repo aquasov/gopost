@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	numberOfWorkers = 1
-	bufferSize      = 5
-	bufferTimeout   = 10000
+	numberOfWorkers = 2
+	bufferSize      = 7
+	bufferTimeout   = 5000
 )
 
 var queue = make(chan []byte, 1024)
@@ -60,11 +60,13 @@ func worker(id int, queue <-chan []byte) {
 	log.Printf("[worker %v] initialized with buffer size %v\n", id, bufferSize)
 	var bufferIndex, recordCount int
 
-	callFlush := func() {
+	callFlush := func(renew bool) {
 		workerWG.Add(1)
 		go flush(buffer)
-		buffer = &[bufferSize][]byte{}
-		bufferIndex = 0
+		if renew {
+			buffer = &[bufferSize][]byte{}
+			bufferIndex = 0
+		}
 	}
 
 	for open := true; open; {
@@ -81,18 +83,18 @@ func worker(id int, queue <-chan []byte) {
 			bufferIndex++
 			if bufferIndex == bufferSize {
 				log.Printf("[worker %v] flushing buffer by size\n", id)
-				callFlush()
+				callFlush(true)
 			}
 		case <-timer.C:
 			if len((*buffer)[0]) > 0 {
 				log.Printf("[worker %v] flushing buffer by timeout\n", id)
-				callFlush()
+				callFlush(true)
 			}
 		}
 	}
 	if len((*buffer)[0]) > 0 {
 		log.Printf("[worker %v] flushing buffer for the last time\n", id)
-		callFlush()
+		callFlush(false)
 	}
 	log.Printf("[worker %v] finished, %v records processed\n", id, recordCount)
 	workerWG.Done()
