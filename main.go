@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -13,16 +14,44 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	_ "github.com/ClickHouse/clickhouse-go"
 )
 
 const (
-	numberOfWorkers = 2
+	numberOfBuffers = 2
 	bufferSize      = 7
 	bufferTimeout   = 5000
 )
 
+const insertTemplate = "INSERT INTO events_buffer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+
+var jsonKeys = []string{
+	"client_time",
+	"client_time",
+	"device_id",
+	"device_os",
+	"session",
+	"sequence",
+	"event",
+}
+
+type Event struct {
+	clientDate      string
+	clientTime      string
+	deviceID        string
+	deviceOS        string
+	session         string
+	sequence        int
+	event           string
+	attributeKeys   []string
+	attributeValues []string
+	metricKeys      []string
+	metricValues    []float64
+}
+
 var queue = make(chan []byte, 1024)
-var workerWG = sync.WaitGroup{}
+var bufferWG = sync.WaitGroup{}
 var handlerWG = sync.WaitGroup{}
 
 func handler(w http.ResponseWriter, req *http.Request) {
@@ -55,16 +84,21 @@ func validate(req *http.Request) bool {
 	return true
 }
 
-func worker(id int, queue <-chan []byte) {
-	var buffer = &[bufferSize][]byte{}
-	log.Printf("[worker %v] initialized with buffer size %v\n", id, bufferSize)
+func buffer(id int, queue <-chan []byte) {
+	var buffer = &[]Event{}
+	log.Printf("[buffer %v] initialized with buffer size %v\n", id, bufferSize)
 	var bufferIndex, recordCount int
 
-	callFlush := func(renew bool) {
-		workerWG.Add(1)
-		go flush(buffer)
+	db, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true")
+	if err != nil {
+		log.Fatalf("[buffer %v] failed to open database connection:\n%v\n", id, err)
+	}
+
+	goFlushBuffer := func(renew bool) {
+		bufferWG.Add(1)
+		go flushBuffer(buffer, db)
 		if renew {
-			buffer = &[bufferSize][]byte{}
+			buffer = &[]Event{}
 			bufferIndex = 0
 		}
 	}
@@ -77,51 +111,124 @@ func worker(id int, queue <-chan []byte) {
 				open = false
 				break
 			}
-			recordCount++
-			log.Printf("[worker %v] buffering record: %v\n", id, string(rec))
-			(*buffer)[bufferIndex] = rec
-			bufferIndex++
-			if bufferIndex == bufferSize {
-				log.Printf("[worker %v] flushing buffer by size\n", id)
-				callFlush(true)
+			if event, err := transformRecordToEvent(&rec); err != nil {
+				log.Printf("[buffer %v] failed to transform record:\nrec: %v\nerr: %v\n", id, string(rec), err)
+				logRecordError(string(rec), err)
+				break
+			} else {
+				recordCount++
+				log.Printf("[buffer %v] buffering record: %v\n", id, event)
+				*buffer = append(*buffer, event)
+				bufferIndex++
+				if bufferIndex == bufferSize {
+					log.Printf("[buffer %v] flushing buffer by size\n", id)
+					goFlushBuffer(true)
+				}
 			}
 		case <-timer.C:
-			if len((*buffer)[0]) > 0 {
-				log.Printf("[worker %v] flushing buffer by timeout\n", id)
-				callFlush(true)
+			if len(*buffer) > 0 {
+				log.Printf("[buffer %v] flushing buffer by timeout\n", id)
+				goFlushBuffer(true)
 			}
 		}
 	}
-	if len((*buffer)[0]) > 0 {
-		log.Printf("[worker %v] flushing buffer for the last time\n", id)
-		callFlush(false)
+	if len(*buffer) > 0 {
+		log.Printf("[buffer %v] flushing buffer for the last time\n", id)
+		goFlushBuffer(false)
 	}
-	log.Printf("[worker %v] finished, %v records processed\n", id, recordCount)
-	workerWG.Done()
+	log.Printf("[buffer %v] finished, %v records processed\n", id, recordCount)
+	bufferWG.Done()
 }
 
-func flush(buf *[bufferSize][]byte) {
-	var jsonMap map[string]interface{}
-	for _, rec := range *buf {
-		if len(rec) < 1 {
-			break
-		}
-		if err := json.Unmarshal(rec, &jsonMap); err != nil {
-			log.Printf("Error paring JSON string '%v': %v", string(rec), err)
+func transformRecordToEvent(r *[]byte) (Event, error) {
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(*r, &m); err != nil {
+		return Event{}, err
+	}
+
+	event := Event{
+		clientDate:      m["client_time"].(string)[0:10],
+		clientTime:      m["client_time"].(string),
+		deviceID:        m["device_id"].(string),
+		deviceOS:        m["device_os"].(string),
+		session:         m["session"].(string),
+		sequence:        int(m["sequence"].(float64)),
+		event:           m["event"].(string),
+		attributeKeys:   []string{},
+		attributeValues: []string{},
+		metricKeys:      []string{},
+		metricValues:    []float64{},
+	}
+
+	for k, v := range m {
+		if arrayOfStringsContainsValue(jsonKeys, k) {
 			continue
 		}
-		log.Println(jsonMap)
+		switch v.(type) {
+		case int, float64:
+			event.metricKeys = append(event.metricKeys, k)
+			event.metricValues = append(event.metricValues, v.(float64))
+		default:
+			event.attributeKeys = append(event.attributeKeys, k)
+			event.attributeValues = append(event.attributeValues, v.(string))
+		}
 	}
-	workerWG.Done()
+
+	return event, nil
+}
+
+func arrayOfStringsContainsValue(a []string, v string) bool {
+	for _, s := range a {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
+func logRecordError(r string, e error) {
+	// TODO: keep error log somewhere
+}
+
+func flushBuffer(buf *[]Event, db *sql.DB) {
+
+	tx, _ := db.Begin()
+	st, _ := tx.Prepare(insertTemplate)
+	defer st.Close()
+
+	for _, event := range *buf {
+		if _, err := st.Exec(
+			event.clientDate,
+			event.clientTime,
+			event.deviceID,
+			event.deviceOS,
+			event.session,
+			event.sequence,
+			event.event,
+			event.attributeKeys,
+			event.attributeValues,
+			event.metricKeys,
+			event.metricValues,
+		); err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Fatal(err)
+	}
+
+	bufferWG.Done()
 }
 
 func main() {
 
-	// start workers
+	// start buffers
 
-	for i := 0; i < numberOfWorkers; i++ {
-		workerWG.Add(1)
-		go worker(i, queue)
+	for i := 0; i < numberOfBuffers; i++ {
+		bufferWG.Add(1)
+		go buffer(i, queue)
 	}
 
 	// start web server
@@ -160,7 +267,7 @@ func main() {
 
 	handlerWG.Wait()
 	close(queue)
-	workerWG.Wait()
+	bufferWG.Wait()
 
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("[server] shutdown error: %v\n", err)
