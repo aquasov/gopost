@@ -84,8 +84,14 @@ func validate(req *http.Request) bool {
 	return true
 }
 
+func makeBuffer(cap int) *[]Event {
+	b := make([]Event, 0, cap)
+	return &b
+}
+
 func buffer(id int, queue <-chan []byte) {
-	var buffer = &[]Event{}
+	// var buffer = &[]Event{}
+	buffer := makeBuffer(bufferSize)
 	log.Printf("[buffer %v] initialized with buffer size %v\n", id, bufferSize)
 	var bufferIndex, recordCount int
 
@@ -98,7 +104,7 @@ func buffer(id int, queue <-chan []byte) {
 		bufferWG.Add(1)
 		go flushBuffer(buffer, db)
 		if renew {
-			buffer = &[]Event{}
+			buffer = makeBuffer(bufferSize)
 			bufferIndex = 0
 		}
 	}
